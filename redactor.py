@@ -1,8 +1,9 @@
 """
 ┌─────────────────────────────────────────────────────────────┐
-│              Local Clipboard Redactor  v0.0                 │
+│              Local Clipboard Redactor  v0.1                 │
 │                                                             │
-│  Hotkey  →  reads clipboard  →  redacts  →  ready to paste  │
+│  Redact hotkey  →  masks sensitive data in clipboard        │
+│  Restore hotkey →  puts originals back after LLM response   │
 │                                                             │
 │  Layer 1 — Regex    : API keys, emails, phones, JWTs …      │
 │  Layer 2 — NER      : PERSON / ORG near trigger words       │
@@ -21,6 +22,7 @@ Run:
 
 import os
 import re
+import time
 import threading
 import unicodedata
 
@@ -46,7 +48,11 @@ except ImportError:
 # CONFIG  — all tuneable knobs in one place
 # ══════════════════════════════════════════════════════════════════════════════
 
-HOTKEY = "<ctrl>+<shift>+x"   # ← Mac users: change to "<cmd>+<shift>+x"
+HOTKEY         = "<ctrl>+<shift>+x"   # ← Mac: "<cmd>+<shift>+x"
+HOTKEY_RESTORE = "<ctrl>+<shift>+z"   # ← Mac: "<cmd>+<shift>+z"  — restores originals
+
+#: Mappings older than this (seconds) are silently dropped during restore.
+SESSION_TTL: int = 3600   # 1 hour
 
 # ── NER settings ──────────────────────────────────────────────────────────────
 
@@ -89,6 +95,56 @@ NER_PUBLIC_ORG_ALLOWLIST: frozenset[str] = frozenset({
     "deloitte", "mckinsey", "salesforce", "atlassian", "slack",
     "zoom", "dropbox", "spotify", "airbnb", "uber", "lyft",
 })
+
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SESSION STORE  — maps placeholder → (original_value, timestamp)
+# Survives across multiple redact calls within the same process lifetime.
+# Entries older than SESSION_TTL are silently skipped during restore.
+# ══════════════════════════════════════════════════════════════════════════════
+
+# { placeholder: (original_value, created_at) }
+_session_store: dict[str, tuple[str, float]] = {}
+
+# Pre-compiled patterns to detect whether clipboard contains placeholders
+_PH_REGEX_DETECT = re.compile(r'\[[A-Z_]+_\d+\]')
+_PH_NER_DETECT   = re.compile(r'\u27ea[A-Z]+\u00b7[0-9a-f]+\u27eb')
+
+
+def _store_mapping(mapping: dict[str, str]) -> None:
+    """Save a redaction mapping into the session store with a timestamp."""
+    now = time.time()
+    for placeholder, original in mapping.items():
+        _session_store[placeholder] = (original, now)
+
+
+def _has_placeholders(text: str) -> bool:
+    """Return True if the text contains any known placeholder format."""
+    return bool(_PH_REGEX_DETECT.search(text) or _PH_NER_DETECT.search(text))
+
+
+def restore(text: str) -> tuple[str, int]:
+    """
+    Replace all recognised placeholders in text with their original values.
+
+    Only restores entries created within SESSION_TTL seconds.
+    Unknown placeholders are left intact.
+
+    Returns (restored_text, count_of_replacements).
+    """
+    now    = time.time()
+    result = text
+    count  = 0
+
+    for placeholder, (original, created_at) in _session_store.items():
+        if now - created_at > SESSION_TTL:
+            continue
+        if placeholder in result:
+            result = result.replace(placeholder, original)
+            count += 1
+
+    return result, count
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -271,6 +327,10 @@ def redact(text: str) -> tuple[str, dict[str, str]]:
     text_after_ner, ner_mapping = _redact_entities(text_after_regex)
 
     combined_mapping = {**regex_mapping, **ner_mapping}
+
+    # Persist to session store so the restore hotkey can look them up later
+    _store_mapping(combined_mapping)
+
     return text_after_ner, combined_mapping
 
 
@@ -338,24 +398,81 @@ def _handle_hotkey() -> None:
     threading.Thread(target=_run, daemon=True).start()
 
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# RESTORE HOTKEY HANDLER
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _handle_restore() -> None:
+    """
+    Ctrl+Shift+Z  — reverse substitution.
+
+    Flow:
+      1. User copies the LLM response   (Ctrl+C)
+      2. User presses restore hotkey    (Ctrl+Shift+Z)
+      3. Clipboard placeholders are swapped back to original values
+      4. User pastes the fully restored response  (Ctrl+V)
+    """
+
+    def _run():
+        text = pyperclip.paste()
+
+        if not text.strip():
+            _notify("Restore", "Clipboard is empty.")
+            return
+
+        if not _has_placeholders(text):
+            _notify("Restore", "No placeholders found in clipboard.")
+            return
+
+        if not _session_store:
+            _notify("Restore ✗", "No session mappings — was this redacted in a previous run?")
+            return
+
+        restored, count = restore(text)
+
+        if count == 0:
+            _notify("Restore ✗", "Placeholders found but no matching session entries.\nMappings may have expired.")
+            return
+
+        pyperclip.copy(restored)
+
+        print("\n\u2500\u2500 Restore complete \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500")
+        print(f"  {count} placeholder{'s' if count > 1 else ''} restored.")
+        print("\u2500" * 62)
+
+        _notify(
+            f"Restore ✓  —  {count} item{'s' if count > 1 else ''} restored",
+            "Original values are back in clipboard.",
+        )
+
+    threading.Thread(target=_run, daemon=True).start()
+
 # ══════════════════════════════════════════════════════════════════════════════
 # ENTRY POINT
 # ══════════════════════════════════════════════════════════════════════════════
 
 def main() -> None:
-    print("──────────────────────────────────────────")
-    print("  Local Clipboard Redactor  v0.0")
-    print("──────────────────────────────────────────")
+    print("──────────────────────────────────────────────────────")
+    print("  Local Clipboard Redactor  v01")
+    print("──────────────────────────────────────────────────────")
 
     # Load NER model in background so the app feels instant to start
     threading.Thread(target=warm_up_model, daemon=True).start()
 
-    print(f"  Hotkey  : {HOTKEY}")
-    print("  Flow    : Copy text → press hotkey → paste redacted text")
-    print("  Layers  : [1] Regex  [2] NER (loads in background)")
-    print("──────────────────────────────────────────\n")
+    print(f"  Redact  : {HOTKEY}")
+    print(f"  Restore : {HOTKEY_RESTORE}")
+    print()
+    print("  Redact flow  : Copy text → press Redact  → paste into AI tool")
+    print("  Restore flow : Copy AI response → press Restore → paste back")
+    print(f"  Session TTL  : {SESSION_TTL // 60} minutes")
+    print("  Layers       : [1] Regex  [2] NER (loads in background)")
+    print("──────────────────────────────────────────────────────\n")
 
-    with keyboard.GlobalHotKeys({HOTKEY: _handle_hotkey}) as listener:
+    with keyboard.GlobalHotKeys({
+        HOTKEY:         _handle_hotkey,
+        HOTKEY_RESTORE: _handle_restore,
+    }) as listener:
         listener.join()
 
 
